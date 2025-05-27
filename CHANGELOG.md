@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Breaking changes
+
+Manipulation of live descriptors now performs the required TLB maintenance
+after each update so that the attribute changes take effect immediately.
+
 ### Improvements
 
 - `Debug` implementation for `RootTable` now includes `translation_regime` and `va_range` fields.
