@@ -972,6 +972,51 @@ mod tests {
     }
 
     #[test]
+    fn modify_unmap_compact() {
+        let mut idmap = IdMap::new(1, 1, TranslationRegime::El1And0);
+        assert_eq!(idmap.size(), PAGE_SIZE * 512 * 512 * 512);
+        // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
+        // active for the sake of BBM rules.
+        let ttbr = unsafe { idmap.activate() };
+
+        // Map two pages, which will cause subtables to be split out.
+        idmap
+            .map_range(
+                &MemoryRegion::new(PAGE_SIZE, PAGE_SIZE * 3),
+                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+            )
+            .unwrap();
+        // Use `modify_range` to unmap the pages.
+        idmap
+            .modify_range(
+                &MemoryRegion::new(PAGE_SIZE, PAGE_SIZE * 3),
+                &|_, descriptor, _| {
+                    descriptor.set(PhysicalAddress(0), Attributes::empty());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        // Compact to remove the subtables.
+        idmap.compact_subtables();
+        // All entries in the top-level table should be 0.
+        idmap
+            .walk_range(
+                &MemoryRegion::new(0, idmap.size()),
+                &mut |region, descriptor, level| {
+                    assert_eq!(region.len(), PAGE_SIZE * 512 * 512);
+                    assert_eq!(descriptor.bits(), 0);
+                    assert_eq!(level, 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        unsafe {
+            idmap.deactivate(ttbr);
+        }
+    }
+
+    #[test]
     fn table_sizes() {
         assert_eq!(IdMap::new(1, 0, TranslationRegime::El1And0).size(), 1 << 48);
         assert_eq!(IdMap::new(1, 1, TranslationRegime::El1And0).size(), 1 << 39);
