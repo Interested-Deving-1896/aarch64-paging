@@ -4,13 +4,25 @@
 
 ### Breaking changes
 
-Manipulation of live descriptors now performs the required TLB maintenance
-after each update so that the attribute changes take effect immediately.
+- Manipulation of live descriptors now performs the required TLB maintenance after each update so
+  that the attribute changes take effect immediately. To achieve this, the `modify_range` methods on
+  `IdMap`, `LinearMap` and `Mapping` now pass the new `UpdatableDescriptor` type rather than
+  `Descriptor` and level to the updater function.
+- `RootTable::modify_range` is no longer public.
+
+### New features
+
+- Added `compact_subtables` method to `IdMap`, `LinearMap`, `Mapping` and `RootTable`. This will
+  replace any subtables which are entirely empty with an invalid descriptor, and free the subtables.
 
 ### Improvements
 
 - `Debug` implementation for `RootTable` now includes `translation_regime` and `va_range` fields.
 - `Debug` implementation for `RootTable` now groups contiguous mapped ranges together.
+- Unmapping a region covering an entire subtable will replace the table descriptor with an invalid
+  descriptor and free the subtable.
+- Unmapping a region will zero the PA, and won't add the `TABLE_OR_PAGE` bit to the attributes
+  given.
 
 ## 0.10.0
 
