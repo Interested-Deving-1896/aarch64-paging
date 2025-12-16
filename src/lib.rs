@@ -169,7 +169,7 @@ impl<T: Translation> Mapping<T> {
         unsafe {
             // Ensure that all page table updates, as well as the increment of the active counter,
             // are visible to all observers before proceeding
-            asm!("dsb ishst", "isb", options(preserves_flags),);
+            asm!("dmb ishst", "isb", options(preserves_flags),);
             match (self.root.translation_regime(), self.root.va_range()) {
                 (TranslationRegime::El1And0, VaRange::Lower) => asm!(
                     "mrs   {previous_ttbr}, ttbr0_el1",
