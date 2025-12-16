@@ -311,8 +311,8 @@ impl<T: Translation> RootTable<T> {
     /// - The virtual address range mapped by each page table descriptor. A new descriptor will
     ///   have been allocated before the invocation of the updater function if a page table split
     ///   was needed.
-    /// - A mutable reference to the page table descriptor that permits modifications.
-    /// - The level of a translation table the descriptor belongs to.
+    /// - An `UpdatableDescriptor`, which includes a mutable reference to the page table descriptor
+    ///   that permits modifications and the level of a translation table the descriptor belongs to.
     ///
     /// The updater function should return:
     ///
@@ -333,7 +333,7 @@ impl<T: Translation> RootTable<T> {
     /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
     /// largest virtual address covered by the page table given its root level.
     ///
-    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub(crate) fn modify_range<F>(
         &mut self,

@@ -184,7 +184,7 @@ impl IdMap {
     ///
     /// Returns [`MapError::InvalidFlags`] if the `flags` argument has unsupported attributes set.
     ///
-    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn map_range(&mut self, range: &MemoryRegion, flags: Attributes) -> Result<(), MapError> {
         self.map_range_with_constraints(range, flags, Constraints::empty())
@@ -208,7 +208,7 @@ impl IdMap {
     ///
     /// Returns [`MapError::InvalidFlags`] if the `flags` argument has unsupported attributes set.
     ///
-    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn map_range_with_constraints(
         &mut self,
@@ -255,7 +255,7 @@ impl IdMap {
     /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
     /// largest virtual address covered by the page table given its root level.
     ///
-    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn modify_range<F>(&mut self, range: &MemoryRegion, f: &F) -> Result<(), MapError>
     where

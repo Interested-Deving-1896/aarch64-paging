@@ -378,7 +378,7 @@ impl<T: Translation> Mapping<T> {
     ///
     /// Returns [`MapError::InvalidFlags`] if the `flags` argument has unsupported attributes set.
     ///
-    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn map_range(
         &mut self,
@@ -412,6 +412,19 @@ impl<T: Translation> Mapping<T> {
     /// without potential splitting (and no descriptor updates), use
     /// [`walk_range`](Self::walk_range) instead.
     ///
+    /// The updater function receives the following arguments:
+    ///
+    /// - The virtual address range mapped by each page table descriptor. A new descriptor will
+    ///   have been allocated before the invocation of the updater function if a page table split
+    ///   was needed.
+    /// - An `UpdatableDescriptor`, which includes a mutable reference to the page table descriptor
+    ///   that permits modifications and the level of a translation table the descriptor belongs to.
+    ///
+    /// The updater function should return:
+    ///
+    /// - `Ok` to continue updating the remaining entries.
+    /// - `Err` to signal an error and stop updating the remaining entries.
+    ///
     /// This should generally only be called while the page table is not active. In particular, any
     /// change that may require break-before-make per the architecture must be made while the page
     /// table is inactive. Mapping a previously unmapped memory range may be done while the page
@@ -426,7 +439,7 @@ impl<T: Translation> Mapping<T> {
     /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
     /// largest virtual address covered by the page table given its root level.
     ///
-    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn modify_range<F>(&mut self, range: &MemoryRegion, f: &F) -> Result<(), MapError>
     where
