@@ -8,9 +8,9 @@
 
 use crate::{
     MapError, Mapping,
+    descriptor::{Attributes, Descriptor, PhysicalAddress, UpdatableDescriptor, VirtualAddress},
     paging::{
-        Attributes, Constraints, Descriptor, MemoryRegion, PageTable, PhysicalAddress, Translation,
-        TranslationRegime, VaRange, VirtualAddress, deallocate,
+        Constraints, MemoryRegion, PageTable, Translation, TranslationRegime, VaRange, deallocate,
     },
 };
 use core::ptr::NonNull;
@@ -65,7 +65,8 @@ impl Translation for IdTranslation {
 /// ```no_run
 /// use aarch64_paging::{
 ///     idmap::IdMap,
-///     paging::{Attributes, MemoryRegion, TranslationRegime},
+///     descriptor::Attributes,
+///     paging::{MemoryRegion, TranslationRegime},
 /// };
 ///
 /// const ASID: usize = 1;
@@ -258,7 +259,7 @@ impl IdMap {
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn modify_range<F>(&mut self, range: &MemoryRegion, f: &F) -> Result<(), MapError>
     where
-        F: Fn(&MemoryRegion, &mut Descriptor, usize) -> Result<(), ()> + ?Sized,
+        F: Fn(&MemoryRegion, &mut UpdatableDescriptor) -> Result<(), ()> + ?Sized,
     {
         self.mapping.modify_range(range, f)
     }
@@ -340,7 +341,8 @@ mod tests {
     use super::*;
     use crate::{
         MapError, VirtualAddress,
-        paging::{Attributes, BITS_PER_LEVEL, MemoryRegion, PAGE_SIZE},
+        descriptor::Attributes,
+        paging::{BITS_PER_LEVEL, MemoryRegion, PAGE_SIZE},
     };
 
     const MAX_ADDRESS_FOR_ROOT_LEVEL_1: usize = 1 << 39;
@@ -691,16 +693,9 @@ mod tests {
         let (mut idmap, ttbr) = make_map();
         assert!(
             idmap
-                .modify_range(
-                    &MemoryRegion::new(PAGE_SIZE * 2, 1),
-                    &|_range, entry, _level| {
-                        entry.modify_flags(
-                            Attributes::SWFLAG_0,
-                            Attributes::from_bits(0usize).unwrap(),
-                        );
-                        Ok(())
-                    },
-                )
+                .modify_range(&MemoryRegion::new(PAGE_SIZE * 2, 1), &|_range, entry| {
+                    entry.modify_flags(Attributes::SWFLAG_0, Attributes::from_bits(0usize).unwrap())
+                },)
                 .is_err()
         );
 
@@ -714,26 +709,28 @@ mod tests {
         let (mut idmap, ttbr) = make_map();
         assert!(
             idmap
-                .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|_range, entry, level| {
-                    if level == 3 || !entry.is_table_or_page() {
-                        entry.modify_flags(Attributes::SWFLAG_0, Attributes::NON_GLOBAL);
+                .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|_range, entry| {
+                    if !entry.is_table() {
+                        entry.modify_flags(Attributes::SWFLAG_0, Attributes::NON_GLOBAL)?;
                     }
                     Ok(())
                 })
                 .is_err()
         );
         idmap
-            .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|_range, entry, level| {
-                if level == 3 || !entry.is_table_or_page() {
-                    entry
-                        .modify_flags(Attributes::SWFLAG_0, Attributes::from_bits(0usize).unwrap());
+            .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|_range, entry| {
+                if !entry.is_table() {
+                    entry.modify_flags(
+                        Attributes::SWFLAG_0,
+                        Attributes::from_bits(0usize).unwrap(),
+                    )?;
                 }
                 Ok(())
             })
             .unwrap();
         idmap
-            .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|range, entry, level| {
-                if level == 3 || !entry.is_table_or_page() {
+            .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|range, entry| {
+                if !entry.is_table() {
                     assert!(entry.flags().contains(Attributes::SWFLAG_0));
                     assert_eq!(range.end() - range.start(), PAGE_SIZE);
                 }
@@ -768,17 +765,14 @@ mod tests {
             )
             .unwrap();
         idmap
-            .modify_range(
-                &MemoryRegion::new(0, BLOCK_RANGE),
-                &|range, entry, level| {
-                    if level == 3 {
-                        let has_swflag = entry.flags().contains(Attributes::SWFLAG_0);
-                        let is_first_page = range.start().0 == 0usize;
-                        assert!(has_swflag != is_first_page);
-                    }
-                    Ok(())
-                },
-            )
+            .modify_range(&MemoryRegion::new(0, BLOCK_RANGE), &|range, entry| {
+                if entry.level() == 3 {
+                    let has_swflag = entry.flags().contains(Attributes::SWFLAG_0);
+                    let is_first_page = range.start().0 == 0usize;
+                    assert!(has_swflag != is_first_page);
+                }
+                Ok(())
+            })
             .unwrap();
 
         unsafe {
@@ -990,10 +984,7 @@ mod tests {
         idmap
             .modify_range(
                 &MemoryRegion::new(PAGE_SIZE, PAGE_SIZE * 3),
-                &|_, descriptor, _| {
-                    descriptor.set(PhysicalAddress(0), Attributes::empty());
-                    Ok(())
-                },
+                &|_, descriptor| descriptor.set(PhysicalAddress(0), Attributes::empty()),
             )
             .unwrap();
         // Compact to remove the subtables.
