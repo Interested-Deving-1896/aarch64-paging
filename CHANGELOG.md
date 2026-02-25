@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- `Attributes` is now called `Stage1Attributes`.
+- `TranslationRegime` enum now includes the `Stage2` variant.
+
+### New features
+
+- Added support for stage-2 page tables.
+
 ## 0.11.0
 
 ### Breaking changes
