@@ -1,32 +1,75 @@
-# aarch64 page table manipulation
+[update-readmes]   Mode: rewrite — migrating to template structure...
+# aarch64-paging
 
-[![crates.io page](https://img.shields.io/crates/v/aarch64-paging.svg)](https://crates.io/crates/aarch64-paging)
-[![docs.rs page](https://docs.rs/aarch64-paging/badge.svg)](https://docs.rs/aarch64-paging)
+[![Built with Ona](https://ona.com/build-with-ona.svg)](https://app.ona.com/#https://github.com/Interested-Deving-1896/aarch64-paging)
 
-This crate provides a library to manipulate page tables conforming to the AArch64 Virtual Memory
-System Architecture.
+<!-- AI:start:what-it-does -->
+_Description pending._
+<!-- AI:end:what-it-does -->
 
-Currently it supports:
+## Architecture
 
-- stage 1 and stage 2 page tables
-- 4 KiB pages
-- EL3, NS-EL2, NS-EL2&0 and NS-EL1&0 translation regimes
-- 64-bit descriptors
+<!-- AI:start:architecture -->
+_Architecture documentation pending._
+<!-- AI:end:architecture -->
 
-This is not an officially supported Google product.
+## Install
+
+<!-- Add installation instructions here. This section is yours — the AI will not modify it. -->
+
+```bash
+git clone https://github.com/Interested-Deving-1896/aarch64-paging.git
+cd aarch64-paging
+```
+
+## Usage
+
+<!-- Add usage examples here. This section is yours — the AI will not modify it. -->
+
+## Configuration
+
+<!-- Document configuration options here. This section is yours — the AI will not modify it. -->
+
+## CI
+
+<!-- AI:start:ci -->
+_CI documentation pending._
+<!-- AI:end:ci -->
+
+## Mirror chain
+
+<!-- AI:start:mirror-chain -->
+This repo is maintained in [`Interested-Deving-1896/aarch64-paging`](https://github.com/Interested-Deving-1896/aarch64-paging) and mirrored through:
+
+```
+Interested-Deving-1896/aarch64-paging  ──►  OpenOS-Project-OSP/aarch64-paging  ──►  OpenOS-Project-Ecosystem-OOC/aarch64-paging
+```
+
+Changes flow downstream automatically via the hourly mirror chain in
+[`fork-sync-all`](https://github.com/Interested-Deving-1896/fork-sync-all).
+Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-Deving-1896`.
+<!-- AI:end:mirror-chain -->
+
+## Contributors
+
+<!-- AI:start:contributors -->
+_Contributors pending._
+<!-- AI:end:contributors -->
+
+## Origins
+
+<!-- AI:start:origins -->
+_Original project — no upstream fork._
+<!-- AI:end:origins -->
+
+## Resources
+
+<!-- AI:start:resources -->
+_No additional resource files found._
+<!-- AI:end:resources -->
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0
-  ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license
-  ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
-
-## Contributing
-
-If you want to contribute to the project, see details of
-[how we accept contributions](CONTRIBUTING.md).
+<!-- AI:start:license -->
+<!-- License not detected — add a LICENSE file to this repo. -->
+<!-- AI:end:license -->
