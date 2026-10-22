@@ -1,11 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.12.3
 
 ### Bugfixes
 
 - Ensure page table updates have completed (`dsb ishst`) before activating a page table or
   performing TLB invalidation on an active page table.
+- Fixed TLB invalidation operand masking. The shifted address was not masked, so the sign extension
+  of an upper range address could spill into the TTL field at bits [47:44] and cause invalidations
+  with a mismatched TTL to be discarded. The operand is now masked to bits [43:0].
+- Fixed TLB invalidation for the `El2And0` translation regime, which used `TLBI VAE2IS` without an
+  ASID and so failed to invalidate non-global entries whose ASID was not 0. It now uses
+  `TLBI VAAE1IS`, which invalidates entries for all ASIDs and is redirected by the architecture
+  to the `EL2&0` regime while `HCR_EL2.TGE` is set.
+- Fixed TLB maintenance when a subtable is removed from a live page table (by `map_range`
+  unmapping its whole range, or by `compact_subtables`): every translation cached from it is now
+  invalidated, and the invalidation completed, before the subtable is freed. Previously only its
+  first address was invalidated by `map_range` and none by `compact_subtables`.
 
 ## 0.12.2
 
