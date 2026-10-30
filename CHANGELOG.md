@@ -8,6 +8,21 @@
   TLB entries that combine stage 1 and stage 2 translations, so a guest could keep using an old
   translation after its mapping changed. Stage 1 is now invalidated with `TLBI VMALLE1IS` once the
   invalidations by IPA have completed.
+- Fixed `MemoryRegion::new` panicking in debug builds if the end of the region is 0, e.g., for a
+  region that ends before it starts, rather than returning a region that `map_range` and
+  `modify_range` reject with `MapError::RegionBackwards`.
+- Fixed `map_range` splitting block mappings that are entirely covered by a range that is being
+  unmapped if the physical address passed to it, which is ignored when unmapping, isn't aligned to
+  the block size, or if `Constraints::NO_BLOCK_MAPPINGS` is given. This split live block mappings
+  without break-before-make.
+- Fixed `modify_range` not performing TLB maintenance for the live descriptors that it updated
+  before the updater function returned an error, which could leave stale translations in the TLB.
+- Fixed `modify_range` splitting block mappings that are only partially covered by the range even
+  if the updater function leaves them unmodified, which violated break-before-make for live block
+  mappings. The updater function is now first called with a copy of such a block descriptor and the
+  part of the range that it covers, and the block mapping is only split if the updater function
+  modifies the copy. If it returns an error for the copy, `modify_range` fails with
+  `MapError::PteUpdateFault`.
 
 ## 0.12.3
 

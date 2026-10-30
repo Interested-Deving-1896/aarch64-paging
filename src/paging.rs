@@ -418,6 +418,12 @@ impl TranslationRegime for El3 {
 }
 
 /// Non-secure Stage 2 translation regime.
+///
+/// TLB maintenance for this regime applies to the VMID in `VTTBR_EL2`, which must therefore be the
+/// VMID that the page table is used with. It also uses `TLBI VMALLE1IS` to invalidate TLB entries
+/// that combine stage 1 and stage 2 translations. As that applies to the EL2&0 translation regime
+/// rather than to the EL1&0 translation regime of the guest while `HCR_EL2.{E2H, TGE}` is `{1, 1}`,
+/// TLB maintenance for this regime must not be performed in that case.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Stage2;
 
@@ -729,9 +735,9 @@ impl<R: TranslationRegime, T: Translation<R::Attributes>> RootTable<R, T> {
     /// memory range.
     ///
     /// This may involve splitting block entries if the provided range is not currently mapped
-    /// down to its precise boundaries. For visiting all the descriptors covering a memory range
-    /// without potential splitting (and no descriptor updates), use
-    /// [`walk_range`](Self::walk_range) instead.
+    /// down to its precise boundaries and the updater function modifies them. For visiting all the
+    /// descriptors covering a memory range without potential splitting (and no descriptor
+    /// updates), use [`walk_range`](Self::walk_range) instead.
     ///
     /// The updater function receives the following arguments:
     ///
@@ -745,6 +751,15 @@ impl<R: TranslationRegime, T: Translation<R::Attributes>> RootTable<R, T> {
     ///
     /// - `Ok` to continue updating the remaining entries.
     /// - `Err` to signal an error and stop updating the remaining entries.
+    ///
+    /// The updater function may also be called with copies of descriptors, to find out what it
+    /// would do without applying the result. While the page table is active, this happens for all
+    /// descriptors covering the range, to check for break-before-make violations first. It also
+    /// happens for block entries that are only partially covered by the range, together with the
+    /// part of the range that they cover, as such a block entry is only split if the updater
+    /// function modifies its copy. So the updater function should modify such a copy if it would
+    /// modify any of the descriptors that the block entry would be split into. Returning `Err` for
+    /// such a copy stops the update, just like for any other descriptor.
     ///
     /// This should generally only be called while the page table is not active. In particular, any
     /// change that may require break-before-make per the architecture must be made while the page
@@ -1095,9 +1110,10 @@ impl<T: Translation<A>, A: PagingAttributes> PageTableWithLevel<T, A> {
                 // with the desired `flags`. So do nothing in this case.
             } else if chunk.is_block(level)
                 && !entry.is_table_or_page()
-                && is_aligned(pa.0, granularity)
-                && !constraints.contains(Constraints::NO_BLOCK_MAPPINGS)
-                && level > 0
+                && (!flags.contains(A::VALID)
+                    || is_aligned(pa.0, granularity)
+                        && !constraints.contains(Constraints::NO_BLOCK_MAPPINGS)
+                        && level > 0)
             {
                 // Rather than leak the entire subhierarchy, only put down
                 // a block mapping if the region is not already covered by
@@ -1282,7 +1298,8 @@ impl<T: Translation<A>, A: PagingAttributes> PageTableWithLevel<T, A> {
     }
 
     /// Modifies a range of page table entries by applying a function to each page table entry.
-    /// If the range is not aligned to block boundaries, block descriptors will be split up.
+    /// Block descriptors that are only partially covered by the range are split up if the function
+    /// modifies them.
     fn modify_range<F, R: TranslationRegime<Attributes = A>>(
         &mut self,
         translation: &mut T,
@@ -1295,36 +1312,70 @@ impl<T: Translation<A>, A: PagingAttributes> PageTableWithLevel<T, A> {
     {
         let mut modified = false;
         let mut need_barrier = false;
+        let mut result = Ok(());
         let level = self.level;
         let mut updated = EntryBitmap::default();
         for chunk in range.split(level) {
             let index = self.entry_index(chunk.start());
             let entry = self.get_entry_mut(chunk.start());
-            if let Some(mut subtable) = entry.subtable(translation, level).or_else(|| {
-                if !chunk.is_block(level) {
-                    // The current chunk is not aligned to the block size at this level
-                    // Split it before recursing to the next level
+            let subtable = match entry.subtable(translation, level) {
+                Some(subtable) => Some(subtable),
+                None if !chunk.is_block(level) => {
+                    // The current chunk is not aligned to the block size at this level, so the
+                    // entry needs to be split before recursing to the next level. However, this
+                    // is only needed if the updater function modifies the entry, so try it on a
+                    // copy first, and leave the entry alone if the updater function doesn't
+                    // modify the copy.
+                    let mut desc = UpdatableDescriptor::clone_from(entry, level, live);
+                    if f(&chunk, &mut desc).is_err() {
+                        result = Err(MapError::PteUpdateFault(entry.bits()));
+                        break;
+                    }
+                    if !desc.updated() {
+                        continue;
+                    }
+                    if live && entry.is_valid() {
+                        // Splitting a live block mapping violates break-before-make, which
+                        // check_range_bbm() should have caught unless the updater function
+                        // behaves differently this time.
+                        result = Err(MapError::BreakBeforeMakeViolation(chunk.clone()));
+                        break;
+                    }
                     Some(Self::split_entry::<R>(translation, &chunk, entry, level))
-                } else {
-                    None
                 }
-            }) {
-                if subtable.modify_range::<F, R>(translation, &chunk, f, live)? {
-                    modified = true;
-                    need_barrier = false;
+                None => None,
+            };
+            if let Some(mut subtable) = subtable {
+                match subtable.modify_range::<F, R>(translation, &chunk, f, live) {
+                    Ok(true) => {
+                        modified = true;
+                        need_barrier = false;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
                 }
             } else {
                 let bits = entry.bits();
                 let mut desc = UpdatableDescriptor::new(entry, level, live);
-                f(&chunk, &mut desc).map_err(|_| MapError::PteUpdateFault(bits))?;
+                let updater_result = f(&chunk, &mut desc);
 
                 if live && desc.updated() {
-                    // Live descriptor was updated so TLB maintenance is needed
+                    // Live descriptor was updated so TLB maintenance is needed, even if the updater
+                    // function returned an error after updating it.
                     updated.set(index);
                     need_barrier = true;
                 }
+                if updater_result.is_err() {
+                    result = Err(MapError::PteUpdateFault(bits));
+                    break;
+                }
             }
         }
+        // If an error occurred halfway, the live descriptors that were updated before still need
+        // TLB maintenance, as the TLB might otherwise keep stale translations for them.
         if !updated.is_empty() {
             if need_barrier {
                 // Ensure all entry updates in this table have completed before invalidating the TLB.
@@ -1337,7 +1388,7 @@ impl<T: Translation<A>, A: PagingAttributes> PageTableWithLevel<T, A> {
             }
             modified = true;
         }
-        Ok(modified)
+        result.map(|()| modified)
     }
 
     /// Walks a range of page table entries and passes each one to a caller provided function.
@@ -1501,7 +1552,7 @@ const fn align_down(value: usize, alignment: usize) -> usize {
 }
 
 const fn align_up(value: usize, alignment: usize) -> usize {
-    ((value - 1) | (alignment - 1)) + 1
+    (value.wrapping_sub(1) | (alignment - 1)).wrapping_add(1)
 }
 
 pub(crate) const fn is_aligned(value: usize, alignment: usize) -> bool {
@@ -1520,6 +1571,14 @@ mod tests {
     use crate::target::TargetAllocator;
     #[cfg(feature = "alloc")]
     use alloc::{format, string::ToString, vec, vec::Vec};
+
+    #[test]
+    fn memory_region_ending_at_zero() {
+        // Aligning the end of the region to the page size must not overflow.
+        assert!(MemoryRegion::new(0, 0).is_empty());
+        let backwards = MemoryRegion::new(PAGE_SIZE, 0);
+        assert!(backwards.end() < backwards.start());
+    }
 
     #[cfg(feature = "alloc")]
     #[test]

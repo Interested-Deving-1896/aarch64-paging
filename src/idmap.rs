@@ -256,9 +256,9 @@ impl<R: TranslationRegime> IdMap<R> {
     /// memory range.
     ///
     /// This may involve splitting block entries if the provided range is not currently mapped
-    /// down to its precise boundaries. For visiting all the descriptors covering a memory range
-    /// without potential splitting (and no descriptor updates), use
-    /// [`walk_range`](Self::walk_range) instead.
+    /// down to its precise boundaries and the updater function modifies them. For visiting all the
+    /// descriptors covering a memory range without potential splitting (and no descriptor
+    /// updates), use [`walk_range`](Self::walk_range) instead.
     ///
     /// The updater function receives the following arguments:
     ///
@@ -272,6 +272,15 @@ impl<R: TranslationRegime> IdMap<R> {
     ///
     /// - `Ok` to continue updating the remaining entries.
     /// - `Err` to signal an error and stop updating the remaining entries.
+    ///
+    /// The updater function may also be called with copies of descriptors, to find out what it
+    /// would do without applying the result. While the page table is active, this happens for all
+    /// descriptors covering the range, to check for break-before-make violations first. It also
+    /// happens for block entries that are only partially covered by the range, together with the
+    /// part of the range that they cover, as such a block entry is only split if the updater
+    /// function modifies its copy. So the updater function should modify such a copy if it would
+    /// modify any of the descriptors that the block entry would be split into. Returning `Err` for
+    /// such a copy stops the update, just like for any other descriptor.
     ///
     /// This should generally only be called while the page table is not active. In particular, any
     /// change that may require break-before-make per the architecture must be made while the page
@@ -682,6 +691,40 @@ mod tests {
     }
 
     #[test]
+    fn unmap_live_block_mapping_with_no_block_mappings() {
+        const BLOCK_SIZE: usize = PAGE_SIZE << BITS_PER_LEVEL;
+        let block = MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE);
+        let mut idmap = IdMap::with_asid(1, 1, El1And0);
+        idmap
+            .map_range(
+                &block,
+                NORMAL_CACHEABLE | El1Attributes::VALID | El1Attributes::ACCESSED,
+            )
+            .unwrap();
+        // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
+        // active for the sake of BBM rules and the TLB emulation.
+        let ttbr = unsafe { idmap.activate() };
+        // Unmapping the entire block mapping must not split it first, which would violate
+        // break-before-make, even though the constraints don't permit block mappings.
+        idmap
+            .map_range_with_constraints(
+                &block,
+                El1Attributes::empty(),
+                Constraints::NO_BLOCK_MAPPINGS,
+            )
+            .unwrap();
+        // SAFETY: This doesn't actually deactivate the page table in tests, it just treats it as
+        // inactive for the sake of BBM rules and the TLB emulation.
+        unsafe { idmap.deactivate(ttbr) };
+        idmap
+            .walk_range(&block, &mut |_, descriptor, level| {
+                assert_eq!((level, descriptor.bits()), (2, 0));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     #[should_panic]
     fn split_live_block_mapping() -> () {
         let mut idmap = IdMap::with_asid(1, 1, El1And0);
@@ -717,6 +760,134 @@ mod tests {
         );
         unsafe { idmap.deactivate(ttbr) };
         r.unwrap();
+    }
+
+    #[test]
+    fn modify_live_mapping_failing_halfway() {
+        let range = MemoryRegion::new(0, 2 * PAGE_SIZE);
+        let mut idmap = IdMap::with_asid(1, 1, El1And0);
+        idmap
+            .map_range(
+                &range,
+                NORMAL_CACHEABLE | El1Attributes::VALID | El1Attributes::ACCESSED,
+            )
+            .unwrap();
+        // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
+        // active for the sake of BBM rules and the TLB emulation.
+        let ttbr = unsafe { idmap.activate() };
+
+        // modify_range() calls the updater for both pages to check for break-before-make
+        // violations first, so this one only fails after making the first page read-only.
+        let calls = core::cell::Cell::new(0);
+        let result = idmap.modify_range(&range, &|_, d| {
+            calls.set(calls.get() + 1);
+            if calls.get() > 3 {
+                return Err(());
+            }
+            d.modify_flags(El1Attributes::READ_ONLY, El1Attributes::empty())
+        });
+        assert!(
+            matches!(result, Err(MapError::PteUpdateFault(_))),
+            "{result:?}"
+        );
+        let mut read_only = alloc::vec::Vec::new();
+        idmap
+            .walk_range(&range, &mut |_, d, _| {
+                read_only.push(d.flags().contains(El1Attributes::READ_ONLY));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(read_only, [true, false]);
+        // The TLB must not hold a stale translation for the first page, which modify_range() checks
+        // in test builds.
+        idmap.modify_range(&range, &|_, _| Ok(())).unwrap();
+
+        // SAFETY: This doesn't actually deactivate the page table in tests, it just treats it as
+        // inactive for the sake of BBM rules and the TLB emulation.
+        unsafe { idmap.deactivate(ttbr) };
+    }
+
+    #[test]
+    fn modify_range_partially_covering_block() {
+        const BLOCK_SIZE: usize = PAGE_SIZE << BITS_PER_LEVEL;
+        let mapped = MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE);
+        let unmapped = MemoryRegion::new(2 * BLOCK_SIZE, 3 * BLOCK_SIZE);
+        let both = MemoryRegion::new(BLOCK_SIZE, 3 * BLOCK_SIZE);
+        // Partially covers both the block mapping and the unmapped block after it.
+        let range = MemoryRegion::new(BLOCK_SIZE + PAGE_SIZE, 2 * BLOCK_SIZE + PAGE_SIZE);
+        let flags = NORMAL_CACHEABLE | El1Attributes::VALID | El1Attributes::ACCESSED;
+        let mut idmap = IdMap::with_asid(1, 1, El1And0);
+        idmap.map_range(&mapped, flags).unwrap();
+        let set_on_valid = |set: El1Attributes| {
+            move |_: &MemoryRegion, d: &mut UpdatableDescriptor<El1Attributes>| {
+                if d.flags().contains(El1Attributes::VALID) {
+                    d.modify_flags(set, El1Attributes::empty())?;
+                }
+                Ok(())
+            }
+        };
+        let walk = |idmap: &IdMap<El1And0>, region: &MemoryRegion| {
+            let mut descriptors = alloc::vec::Vec::new();
+            idmap
+                .walk_range(region, &mut |mr, d, level| {
+                    descriptors.push((mr.clone(), level, d.flags()));
+                    Ok(())
+                })
+                .unwrap();
+            descriptors
+        };
+        let unsplit = [
+            (mapped.clone(), 2, flags),
+            (unmapped.clone(), 2, El1Attributes::empty()),
+        ];
+
+        // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
+        // active for the sake of BBM rules.
+        let ttbr = unsafe { idmap.activate() };
+        // Updates that don't modify the block mapping must not split it, as that would violate
+        // break-before-make.
+        let accessed = set_on_valid(El1Attributes::ACCESSED);
+        idmap.modify_range(&range, &accessed).unwrap();
+        assert_eq!(walk(&idmap, &both), unsplit);
+        // Updates that do modify it are not permitted.
+        let swflag = set_on_valid(El1Attributes::SWFLAG_0);
+        assert_eq!(
+            idmap.modify_range(&range, &swflag),
+            Err(MapError::BreakBeforeMakeViolation(MemoryRegion::new(
+                BLOCK_SIZE + PAGE_SIZE,
+                2 * BLOCK_SIZE
+            )))
+        );
+        assert_eq!(walk(&idmap, &both), unsplit);
+        // SAFETY: This doesn't actually deactivate the page table in tests, it just treats it as
+        // inactive for the sake of BBM rules.
+        unsafe { idmap.deactivate(ttbr) };
+
+        // While the page table is inactive, updates that don't modify a block mapping still leave
+        // it alone, and so do updates that fail for it, but updates that do modify it split it.
+        idmap.modify_range(&range, &accessed).unwrap();
+        assert_eq!(walk(&idmap, &both), unsplit);
+        assert_eq!(
+            idmap.modify_range(&range, &|_, _| Err(())),
+            Err(MapError::PteUpdateFault(BLOCK_SIZE | flags.bits()))
+        );
+        assert_eq!(walk(&idmap, &both), unsplit);
+        idmap.modify_range(&range, &swflag).unwrap();
+        let pages = walk(&idmap, &mapped);
+        assert_eq!(pages.len(), 1 << BITS_PER_LEVEL);
+        for (i, (mr, level, page_flags)) in pages.into_iter().enumerate() {
+            let start = BLOCK_SIZE + i * PAGE_SIZE;
+            let mut expected = flags | El1Attributes::TABLE_OR_PAGE;
+            if i > 0 {
+                expected |= El1Attributes::SWFLAG_0;
+            }
+            assert_eq!(
+                (mr, level, page_flags),
+                (MemoryRegion::new(start, start + PAGE_SIZE), 3, expected)
+            );
+        }
+        // The unmapped block is left alone, as the update doesn't modify invalid descriptors.
+        assert_eq!(walk(&idmap, &unmapped), unsplit[1..]);
     }
 
     fn make_map() -> (IdMap<El1And0>, usize) {
