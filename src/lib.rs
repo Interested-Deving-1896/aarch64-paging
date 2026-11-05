@@ -19,21 +19,23 @@
 //! ```no_run
 //! # #[cfg(feature = "alloc")] {
 //! use aarch64_paging::{
-//!     idmap::IdMap,
+//!     Mapping,
 //!     descriptor::El1Attributes,
-//!     paging::{MemoryRegion, El1And0},
+//!     idmap::IdTranslation,
+//!     paging::{Constraints, El1And0, MemoryRegion},
 //! };
 //!
 //! const ASID: usize = 1;
 //! const ROOT_LEVEL: usize = 1;
 //! const NORMAL_CACHEABLE: El1Attributes = El1Attributes::ATTRIBUTE_INDEX_1.union(El1Attributes::INNER_SHAREABLE);
 //!
-//! // Create a new EL1 page table with identity mapping.
-//! let mut idmap = IdMap::with_asid(ASID, ROOT_LEVEL, El1And0);
+//! // Create a new EL1 page table with identity mapping, which implies the lower VA range.
+//! let mut idmap = Mapping::new(IdTranslation::new(), ROOT_LEVEL, El1And0::with_asid(ASID));
 //! // Map a 2 MiB region of memory as read-write.
-//! idmap.map_range(
+//! idmap.map_fixed_range(
 //!     &MemoryRegion::new(0x80200000, 0x80400000),
 //!     NORMAL_CACHEABLE | El1Attributes::NON_GLOBAL | El1Attributes::VALID | El1Attributes::ACCESSED,
+//!     Constraints::empty(),
 //! ).unwrap();
 //! // SAFETY: Everything the program uses is within the 2 MiB region mapped above.
 //! unsafe {
@@ -61,6 +63,7 @@ pub mod target;
 #[cfg(any(test, feature = "alloc"))]
 extern crate alloc;
 
+use bitflags::Flags;
 #[cfg(target_arch = "aarch64")]
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -68,7 +71,10 @@ use descriptor::{
     Descriptor, DescriptorBits, PagingAttributes, PhysicalAddress, UpdatableDescriptor,
     VirtualAddress,
 };
-use paging::{Constraints, MemoryRegion, RootTable, Translation, TranslationRegime, VaRange};
+use paging::{
+    Constraints, FixedTranslation, MemoryRegion, PAGE_SIZE, RootTable, Translation,
+    TranslationRegime,
+};
 use thiserror::Error;
 
 /// An error attempting to map some range in the page table.
@@ -131,36 +137,22 @@ fn wait_for_store_completion() {
     }
 }
 
-impl<T: Translation<R::Attributes>, R: TranslationRegime<Asid = (), VaRange = ()>> Mapping<T, R> {
-    /// Creates a new page table with the given root level and translation mapping.
-    pub fn new(translation: T, rootlevel: usize, regime: R) -> Self {
-        Self::new_impl(RootTable::new(translation, rootlevel, regime), ())
-    }
-}
-
-impl<T: Translation<R::Attributes>, R: TranslationRegime<Asid = usize, VaRange = VaRange>>
-    Mapping<T, R>
-{
-    /// Creates a new page table with the given ASID, root level and translation mapping.
-    pub fn with_asid_and_va_range(
-        translation: T,
-        asid: usize,
-        rootlevel: usize,
-        regime: R,
-        va_range: VaRange,
-    ) -> Self {
-        Self::new_impl(
-            RootTable::with_va_range(translation, rootlevel, regime, va_range),
-            asid,
-        )
-    }
-}
-
 impl<T: Translation<R::Attributes>, R: TranslationRegime> Mapping<T, R> {
-    fn new_impl(root: RootTable<R, T>, asid: R::Asid) -> Self {
+    /// Creates a new page table with the given translation, root level and translation regime.
+    ///
+    /// For translation regimes that support ASIDs, the ASID that the page table is tagged with is
+    /// taken from `regime`, e.g. [`El1And0::with_asid`](paging::El1And0::with_asid). The VA range
+    /// that the page table covers, i.e. which TTBR it is used with, is taken from `translation`,
+    /// see [`Translation::va_range`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the root level is greater than 3, or if `translation` selects the upper VA range
+    /// but `regime` only has the lower VA range.
+    pub fn new(translation: T, rootlevel: usize, regime: R) -> Self {
         Self {
-            root,
-            asid,
+            asid: regime.asid(),
+            root: RootTable::new(translation, rootlevel, regime),
             active_count: AtomicUsize::new(0),
         }
     }
@@ -217,8 +209,11 @@ impl<T: Translation<R::Attributes>, R: TranslationRegime> Mapping<T, R> {
     }
 
     /// Deactivates the page table, by setting `TTBRn_ELx` to the provided value, and invalidating
-    /// the TLB for this page table's configured ASID. The provided TTBR value should be the value
-    /// returned by the preceding [`activate`](Self::activate) call.
+    /// the TLB entries that the page table may have given rise to on the current CPU. For the EL1&0
+    /// and EL2&0 translation regimes, this invalidates all TLB entries of the translation regime
+    /// rather than just those for this page table's configured ASID, as those for global mappings
+    /// are not tagged with an ASID. The provided TTBR value should be the value returned by the
+    /// preceding [`activate`](Self::activate) call.
     ///
     /// In test builds or builds that do not target aarch64, the `TTBRn_ELx` access is omitted.
     ///
@@ -294,7 +289,9 @@ impl<T: Translation<R::Attributes>, R: TranslationRegime> Mapping<T, R> {
     }
 
     /// Maps the given range of virtual addresses to the corresponding range of physical addresses
-    /// starting at `pa`, with the given flags, taking the given constraints into account.
+    /// starting at `pa`, with the given flags, taking the given constraints into account. Like the
+    /// range, `pa` is rounded down to a multiple of [`PAGE_SIZE`](paging::PAGE_SIZE), so the start
+    /// of the range is mapped to the start of the page that contains `pa`.
     ///
     /// To unmap a range, pass `flags` which don't contain the [`PagingAttributes::VALID`] bit.
     /// In this case the `pa` is ignored.
@@ -323,23 +320,46 @@ impl<T: Translation<R::Attributes>, R: TranslationRegime> Mapping<T, R> {
         flags: R::Attributes,
         constraints: Constraints,
     ) -> Result<(), MapError> {
+        // Round down `pa` like `RootTable` does, so that the check for break-before-make violations
+        // below agrees with it.
+        let pa = pa.align_down(PAGE_SIZE);
         let live = self.active();
         if live {
             let c = |mr: &MemoryRegion, d: &mut UpdatableDescriptor<R::Attributes>| {
-                let mask = !(paging::granularity_at_level(d.level()) - 1);
-                let pa = (mr.start() - range.start() + pa.0) & mask;
-                let flags = if d.level() == 3 {
+                let level = d.level();
+                let valid = d.flags().contains(R::Attributes::VALID);
+                // The output address that the start of the block or page that maps `mr` would
+                // have if the update were applied to all of it, rather than just to `mr`.
+                let offset = mr.start().0 % paging::granularity_at_level(level);
+                let Some(pa) = (mr.start() - range.start() + pa.0).checked_sub(offset) else {
+                    // The update can only be applied by splitting the block mapping, which is
+                    // not permitted while it is valid. If it is invalid, none of the remaining
+                    // checks are required, and we can return success right away.
+                    return if valid { Err(()) } else { Ok(()) };
+                };
+                let flags = if level == 3 {
                     flags | R::Attributes::TABLE_OR_PAGE
                 } else {
                     flags
                 };
-                d.set(PhysicalAddress(pa), flags)
+                d.set(PhysicalAddress(pa), flags)?;
+                // map_range() also splits a valid block mapping that it modifies if block mappings
+                // are not permitted, as well as one that it maps to an output address that isn't
+                // suitably aligned for a block mapping.
+                if valid
+                    && level < 3
+                    && flags.contains(R::Attributes::VALID)
+                    && (d.updated() && constraints.contains(Constraints::NO_BLOCK_MAPPINGS)
+                        || !paging::is_aligned(pa, paging::granularity_at_level(level)))
+                {
+                    return Err(());
+                }
+                Ok(())
             };
             // map_range() only splits a block mapping if its output address or attributes change.
             self.check_range_bbm(range, &c)?;
         }
-        self.root
-            .map_range_impl(range, pa, flags, constraints, live)?;
+        self.root.map_range(range, pa, flags, constraints, live)?;
         self.invalidate_range(range);
         Ok(())
     }
@@ -434,7 +454,7 @@ impl<T: Translation<R::Attributes>, R: TranslationRegime> Mapping<T, R> {
     /// every time a region is unmapped. You could instead call it when the system is under memory
     /// pressure.
     pub fn compact_subtables(&mut self) {
-        self.root.compact_subtables_impl(self.active());
+        self.root.compact_subtables(self.active());
     }
 
     /// Returns the physical address of the root table.
@@ -478,10 +498,262 @@ impl<T: Translation<R::Attributes>, R: TranslationRegime> Mapping<T, R> {
     }
 }
 
+impl<T: Translation<R::Attributes> + FixedTranslation, R: TranslationRegime> Mapping<T, R> {
+    /// Maps the given range of virtual addresses to the corresponding physical addresses with the
+    /// given flags, taking the given constraints into account.
+    ///
+    /// This should generally only be called while the page table is not active. In particular, any
+    /// change that may require break-before-make per the architecture must be made while the page
+    /// table is inactive. Mapping a previously unmapped memory range may be done while the page
+    /// table is active. This function writes block and page entries, but only maps them if `flags`
+    /// contains [`PagingAttributes::VALID`], otherwise the entries remain invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MapError::InvalidVirtualAddress`] if the `range` is not allowed by
+    /// [`FixedTranslation::virtual_to_physical`].
+    ///
+    /// Returns [`MapError::RegionBackwards`] if the range is backwards.
+    ///
+    /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
+    /// largest virtual address covered by the page table given its root level.
+    ///
+    /// Returns [`MapError::InvalidFlags`] if the `flags` argument has unsupported attributes set.
+    ///
+    /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
+    /// and modifying those would violate architectural break-before-make (BBM) requirements.
+    pub fn map_fixed_range(
+        &mut self,
+        range: &MemoryRegion,
+        flags: R::Attributes,
+        constraints: Constraints,
+    ) -> Result<(), MapError> {
+        let pa = self.translation().virtual_to_physical(range.start())?;
+        self.map_range(range, pa, flags, constraints)
+    }
+}
+
 impl<T: Translation<R::Attributes>, R: TranslationRegime> Drop for Mapping<T, R> {
     fn drop(&mut self) {
         if self.active() {
             panic!("Dropping active page table mapping!");
         }
+    }
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+    use super::*;
+    use crate::descriptor::{El1Attributes, El23Attributes};
+    use crate::idmap::IdTranslation;
+    use crate::linearmap::LinearTranslation;
+    use crate::paging::{El1And0, El2, El2And0, PAGE_SIZE, VaRange};
+    use alloc::vec::Vec;
+
+    const BLOCK_SIZE: usize = PAGE_SIZE << 9;
+    const NORMAL: El1Attributes = El1Attributes::VALID
+        .union(El1Attributes::ACCESSED)
+        .union(El1Attributes::ATTRIBUTE_INDEX_1)
+        .union(El1Attributes::INNER_SHAREABLE);
+
+    /// Maps a block at `BLOCK_SIZE`, makes it live, and then calls `map_range` with the given
+    /// arguments, which must not split the live block mapping, and returns its result.
+    fn try_remap_live_block(
+        range: MemoryRegion,
+        pa: usize,
+        flags: El1Attributes,
+        constraints: Constraints,
+    ) -> Result<(), MapError> {
+        let mut mapping = Mapping::new(IdTranslation::new(), 1, El1And0::with_asid(1));
+        let block = MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE);
+        mapping
+            .map_range(
+                &block,
+                PhysicalAddress(BLOCK_SIZE),
+                NORMAL,
+                Constraints::empty(),
+            )
+            .unwrap();
+        // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
+        // active for the sake of BBM rules.
+        let ttbr = unsafe { mapping.activate() };
+        let result = mapping.map_range(&range, PhysicalAddress(pa), flags, constraints);
+        // SAFETY: As above.
+        unsafe { mapping.deactivate(ttbr) };
+        let mut levels = Vec::new();
+        mapping
+            .walk_range(&block, &mut |_, _, level| {
+                levels.push(level);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(levels, [2], "The live block mapping was split");
+        result
+    }
+
+    /// Maps a block at `BLOCK_SIZE`, makes it live, and then calls `map_range` with the given
+    /// arguments, which must fail rather than split the live block mapping.
+    fn remap_live_block(
+        range: MemoryRegion,
+        pa: usize,
+        flags: El1Attributes,
+        constraints: Constraints,
+    ) {
+        let result = try_remap_live_block(range, pa, flags, constraints);
+        assert!(
+            matches!(result, Err(MapError::BreakBeforeMakeViolation(_))),
+            "map_range returned {result:?}"
+        );
+    }
+
+    #[test]
+    fn split_live_block_without_block_mappings() {
+        remap_live_block(
+            MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE),
+            BLOCK_SIZE,
+            NORMAL | El1Attributes::READ_ONLY,
+            Constraints::NO_BLOCK_MAPPINGS,
+        );
+    }
+
+    #[test]
+    fn split_live_block_for_unaligned_pa() {
+        remap_live_block(
+            MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE),
+            BLOCK_SIZE + PAGE_SIZE,
+            NORMAL,
+            Constraints::empty(),
+        );
+    }
+
+    /// A physical address that isn't page aligned is rounded down, so this leaves the live block
+    /// mapping unchanged.
+    #[test]
+    fn remap_live_block_for_pa_with_offset() {
+        let result = try_remap_live_block(
+            MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE),
+            BLOCK_SIZE + 0x123,
+            NORMAL,
+            Constraints::empty(),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    /// A physical address that isn't page aligned is rounded down, so it doesn't prevent block
+    /// mappings if the address it is rounded down to is suitably aligned, nor does it make
+    /// `map_range` split a block mapping that already maps that address.
+    #[test]
+    fn map_block_for_pa_with_offset() {
+        let mut mapping = Mapping::new(IdTranslation::new(), 1, El1And0::with_asid(1));
+        let block = MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE);
+        for pa in [BLOCK_SIZE + 0x123, BLOCK_SIZE + 0x456] {
+            mapping
+                .map_range(&block, PhysicalAddress(pa), NORMAL, Constraints::empty())
+                .unwrap();
+            let mut descriptors = Vec::new();
+            mapping
+                .walk_range(&block, &mut |_, d, level| {
+                    descriptors.push((level, d.output_address()));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(descriptors, [(2, PhysicalAddress(BLOCK_SIZE))]);
+        }
+    }
+
+    /// `UpdatableDescriptor::set` rounds down a physical address that isn't page aligned as well,
+    /// so setting a live descriptor to such an address within the page it maps is permitted.
+    #[test]
+    fn set_live_descriptor_to_pa_with_offset() {
+        let mut mapping = Mapping::new(IdTranslation::new(), 1, El1And0::with_asid(1));
+        let block = MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE);
+        mapping
+            .map_range(
+                &block,
+                PhysicalAddress(BLOCK_SIZE),
+                NORMAL,
+                Constraints::empty(),
+            )
+            .unwrap();
+        // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
+        // active for the sake of BBM rules.
+        let ttbr = unsafe { mapping.activate() };
+        let result = mapping.modify_range(&block, &|_, d| {
+            let flags = d.flags();
+            d.set(d.output_address() + 0x123, flags)
+        });
+        // SAFETY: As above.
+        unsafe { mapping.deactivate(ttbr) };
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn split_live_block_for_different_pa() {
+        remap_live_block(
+            MemoryRegion::new(BLOCK_SIZE + PAGE_SIZE, BLOCK_SIZE + 2 * PAGE_SIZE),
+            BLOCK_SIZE,
+            NORMAL,
+            Constraints::empty(),
+        );
+    }
+
+    #[test]
+    fn split_live_block_for_pa_below_offset() {
+        remap_live_block(
+            MemoryRegion::new(BLOCK_SIZE + PAGE_SIZE, BLOCK_SIZE + 2 * PAGE_SIZE),
+            0,
+            NORMAL,
+            Constraints::empty(),
+        );
+    }
+
+    /// The ASID is taken from the translation regime, for translation regimes that have one.
+    #[test]
+    fn asid_from_regime() {
+        let mapping = Mapping::new(IdTranslation::new(), 1, El1And0::with_asid(42));
+        assert_eq!(mapping.asid(), 42);
+        let mapping = Mapping::new(IdTranslation::new(), 1, El2And0::with_asid(7));
+        assert_eq!(mapping.asid(), 7);
+        // EL2 has no ASID, so there is nothing to pass.
+        let mapping = Mapping::new(IdTranslation::new(), 1, El2);
+        let () = mapping.asid();
+    }
+
+    /// The VA range is taken from the translation, and an identity translation always covers the
+    /// lower VA range.
+    #[test]
+    fn va_range_from_translation() {
+        const UPPER_VA: usize = 0xffff_ffff_8000_0000;
+        let region = MemoryRegion::new(UPPER_VA, UPPER_VA + PAGE_SIZE);
+
+        let mut idmap = Mapping::new(IdTranslation::new(), 0, El1And0::with_asid(1));
+        assert_eq!(idmap.root.va_range_or_unit(), VaRange::Lower);
+        assert_eq!(
+            idmap.map_fixed_range(&region, NORMAL, Constraints::empty()),
+            Err(MapError::AddressRange(region.start()))
+        );
+
+        let mut upper = Mapping::new(
+            LinearTranslation::new(1 << 39, VaRange::Upper),
+            0,
+            El1And0::with_asid(1),
+        );
+        assert_eq!(upper.root.va_range_or_unit(), VaRange::Upper);
+        assert_eq!(
+            upper.map_fixed_range(&region, NORMAL, Constraints::empty()),
+            Ok(())
+        );
+    }
+
+    /// A translation for the upper VA range can't be used with a translation regime which only
+    /// has the lower VA range.
+    #[test]
+    #[should_panic(expected = "Translation regime El2 doesn't support the Upper VA range.")]
+    fn upper_va_range_needs_two_va_ranges() {
+        Mapping::new(
+            LinearTranslation::<El23Attributes>::new(1 << 39, VaRange::Upper),
+            1,
+            El2,
+        );
     }
 }

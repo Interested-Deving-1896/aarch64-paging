@@ -9,6 +9,7 @@ use crate::Translation;
 use crate::paging::LEAF_LEVEL;
 use crate::paging::PAGE_SIZE;
 use crate::paging::PageTableWithLevel;
+use crate::paging::align_down;
 
 use bitflags::bitflags;
 use core::fmt::{self, Debug, Display, Formatter};
@@ -62,6 +63,15 @@ impl Sub<usize> for VirtualAddress {
 #[derive(Copy, Clone, Default, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct PhysicalAddress(pub usize);
+
+impl PhysicalAddress {
+    /// Returns a new physical address created by aligning this one down to the given alignment.
+    ///
+    /// The alignment must be a power of 2, or else an unexpected value will be returned.
+    pub const fn align_down(self, alignment: usize) -> Self {
+        Self(align_down(self.0, alignment))
+    }
+}
 
 impl Display for PhysicalAddress {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
@@ -513,9 +523,12 @@ impl<'a, A: PagingAttributes> UpdatableDescriptor<'a, A> {
         }
     }
 
-    /// Assigns the underlying descriptor according to `pa` and `flags, provided that doing so is
-    /// permitted under BBM rules
+    /// Assigns the underlying descriptor according to `pa` and `flags`, provided that doing so is
+    /// permitted under BBM rules. `pa` is rounded down to a multiple of [`PAGE_SIZE`].
     pub fn set(&mut self, pa: PhysicalAddress, flags: A) -> Result<(), ()> {
+        // Only the page that `pa` points into ends up in the descriptor, so ignore the offset into
+        // the page when checking for BBM violations as well.
+        let pa = pa.align_down(PAGE_SIZE);
         if !self.bbm_permits_update(pa, flags) {
             return Err(());
         }

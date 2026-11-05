@@ -23,6 +23,70 @@
   part of the range that it covers, and the block mapping is only split if the updater function
   modifies the copy. If it returns an error for the copy, `modify_range` fails with
   `MapError::PteUpdateFault`.
+- Fixed `map_range` panicking with an arithmetic overflow in debug builds if the physical address
+  passed to it is below the offset of the range within a block that is already mapped, or unmapped,
+  with the same attributes, e.g., when unmapping a range that doesn't start at a block boundary
+  with physical address 0.
+- Fixed `Mapping::deactivate` not invalidating the TLB entries for global mappings of page tables
+  for the EL1&0 and EL2&0 translation regimes, as it used `TLBI ASIDE1`, which only affects
+  non-global entries. As updating a page table while it is inactive requires no TLB maintenance,
+  such entries could remain in use for mappings that were changed while the page table was
+  inactive, once it was activated again. It now uses `TLBI VMALLE1` to invalidate all TLB entries
+  of the translation regime on the current CPU.
+- Fixed `map_range` and `UpdatableDescriptor::set` treating a physical address that isn't page
+  aligned differently from the page aligned address below it, which is what ends up in the
+  descriptors. Such an address prevented block mappings, and made `map_range` split block mappings
+  that already mapped it, even live ones without break-before-make, and `UpdatableDescriptor::set`
+  refused to set it for live descriptors that already mapped it. The physical address is now
+  rounded down to a multiple of the page size in both cases.
+- Fixed `Mapping::map_range` splitting live block mappings without break-before-make, rather than
+  failing with `MapError::BreakBeforeMakeViolation`, if `Constraints::NO_BLOCK_MAPPINGS` is given,
+  or if the physical address passed to it would map the start of a block that the range covers to
+  an address that isn't aligned to the block size, e.g., because the range only covers part of the
+  block and is moved by less than the block size.
+
+### Improvements
+
+- Added `align_down` method to `PhysicalAddress`.
+- Added a new `FixedTranslation` trait implemented by `IdTranslation` and `LinearTranslation`, and
+  a new method `Mapping::map_fixed_range` for translations implementing this trait.
+
+### Breaking changes
+
+- Changed `IdMap` and `LinearMap` into aliases rather than newtypes. To migrate existing users:
+  - Replace `IdMap::new(ROOT_LEVEL, REGIME)` with
+    `Mapping::new(IdTranslation::new(), ROOT_LEVEL, REGIME)`.
+  - Replace `IdMap::with_asid(ASID, ROOT_LEVEL, REGIME)` with
+    `Mapping::new(IdTranslation::new(), ROOT_LEVEL, REGIME::with_asid(ASID))`.
+  - Replace `LinearMap::new(ROOT_LEVEL, OFFSET, REGIME)` with
+    `Mapping::new(LinearTranslation::new(OFFSET, VaRange::Lower), ROOT_LEVEL, REGIME)`.
+  - Replace `LinearMap::with_asid(ASID, ROOT_LEVEL, OFFSET, REGIME, VA_RANGE)` with
+    `Mapping::new(LinearTranslation::new(OFFSET, VA_RANGE), ROOT_LEVEL, REGIME::with_asid(ASID))`.
+  - Replace calls to `map_range` and `map_range_with_constraints` on `IdMap` and `LinearMap` with
+    `map_fixed_range`.
+- `RootTable` is no longer public. It has no way of knowing whether the page table it manages is
+  live, and so it cannot perform the TLB maintenance that updating a live page table requires. Use
+  `Mapping` instead, which only performs TLB maintenance while the page table is active, e.g.,
+  together with `TargetAllocator` to build a page table for a separate target device.
+- Replaced `Mapping::with_asid_and_va_range` with `Mapping::new`, which now works for all
+  translation regimes. The ASID and the VA range are no longer separate arguments, but are only
+  given where they make sense:
+  - The ASID is part of the translation regime, for the regimes that support ASIDs:
+    `El1And0` and `El2And0` are no longer unit structs, and are created with `El1And0::with_asid`
+    and `El2And0::with_asid`. `TranslationRegime` has a new `asid` method.
+  - The VA range is taken from the translation, via the new `Translation::va_range` method, which
+    defaults to `VaRange::Lower`. `IdTranslation` always covers the lower VA range, while
+    `LinearTranslation::new` and `TargetAllocator::new` now take the VA range as an argument.
+    `Mapping::new` panics if the translation selects the upper VA range for a translation regime
+    which only has the lower one.
+  - `LinearTranslation::new` panics if the offset and the VA range are inconsistent, i.e., if the
+    offset maps no address in the VA range to a physical address. As bit 55 of a virtual address
+    selects the VA range, and physical addresses occupy at most 52 bits, the offset must be between
+    -2^55 and 2^52 for the lower VA range, and between 0 and 2^55 + 2^52 for the upper VA range
+    (exclusive).
+  - Replace `Mapping::with_asid_and_va_range(TRANSLATION, ASID, ROOT_LEVEL, REGIME, VA_RANGE)` with
+    `Mapping::new(TRANSLATION, ROOT_LEVEL, REGIME::with_asid(ASID))`, where `TRANSLATION` selects
+    `VA_RANGE`, e.g., `LinearTranslation::new(OFFSET, VA_RANGE)`.
 
 ## 0.12.3
 
